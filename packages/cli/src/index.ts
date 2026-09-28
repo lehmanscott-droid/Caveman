@@ -24,6 +24,7 @@ import {
   statSync,
   symlinkSync,
   unlinkSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { chmod, mkdir, open, readFile, rename, writeFile } from "node:fs/promises";
@@ -896,6 +897,62 @@ function telemetryTokenWatermarkFromDisk(): TelemetryTokenWatermark | null {
   }
 }
 
+// telemetryClaimLockPath is the sidecar used to serialize the read-compare-write
+// below across OS processes; it sits beside config.json so its permission and
+// cross-filesystem behavior always matches the file it protects.
+function telemetryClaimLockPath(): string {
+  return `${configPath()}.telemetry.lock`;
+}
+
+// A lock older than this is presumed abandoned by a crashed holder; kept far
+// above a real claim's own write time and above any waiter's acquire budget,
+// so a slow but live holder is never mistaken for a dead one.
+const TELEMETRY_CLAIM_LOCK_STALE_MS = 5000;
+
+// acquireClaimLock spins on an atomic O_CREAT|O_EXCL create until it wins the
+// lock or the budget runs out; a lock whose mtime is older than staleMs is
+// treated as abandoned by a crashed holder and reclaimed, so a killed process
+// cannot wedge the guarded operation off permanently.
+//
+// Shared by every watermark claim rather than copied per caller: the telemetry
+// claim (#1116) and the sync claim (#1132) are the same read-mutate-write
+// hazard over different state files, and a second copy of this spin is how the
+// two would drift apart. Callers supply their own stale window because their
+// hold times differ by orders of magnitude — see refreshClaimLock.
+function acquireClaimLock(lockPath: string, budgetMs: number, staleMs: number): boolean {
+  try {
+    mkdirSync(dirname(lockPath), { recursive: true });
+  } catch {
+    return false;
+  }
+  const deadline = Date.now() + budgetMs;
+  for (;;) {
+    try {
+      closeSync(openSync(lockPath, "wx"));
+      return true;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") return false;
+      try {
+        if (Date.now() - statSync(lockPath).mtimeMs > staleMs) unlinkSync(lockPath);
+      } catch {
+        /* raced the holder releasing it; loop back to the create attempt */
+      }
+      if (Date.now() >= deadline) return false;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+    }
+  }
+}
+
+// releaseClaimLock drops a lock taken above. Never throws: a lock already gone
+// (reclaimed as stale by someone else) is the same end state as one we removed.
+function releaseClaimLock(lockPath: string): void {
+  try {
+    unlinkSync(lockPath);
+  } catch {
+    /* already gone */
+  }
+}
+
 // telemetryTokenDelta returns what to report for THIS event and advances the
 // watermark to the totals it read. The send is fire-and-forget, so a dropped POST
 // loses that delta rather than replaying it — undercounting beats double-counting
@@ -916,11 +973,13 @@ function telemetryTokenDelta(): { processed: number; saved: number; basis: strin
   const saved = prior && !rewound ? Math.max(0, totals.tokensSaved - prior.tokensSaved) : 0;
   const rebaselining = prior === null || rewound;
   if (processed === 0 && saved === 0 && !rebaselining) return null;
-  // Claim the delta optimistically: two CLI processes exiting together would
-  // otherwise read the same watermark and both report the same tokens, inflating
-  // a savings figure. Whoever writes second sees the watermark already moved and
-  // reports nothing.
+  // Claim the delta under a lock, not a bare compare: two processes exiting
+  // together can both read the pre-write watermark before either commits (see
+  // the regression test below).
+  const lockPath = telemetryClaimLockPath();
+  if (!acquireClaimLock(lockPath, 500, TELEMETRY_CLAIM_LOCK_STALE_MS)) return null;
   let claimed = true;
+  let readOnly = false;
   try {
     mutateRawConfig((out) => {
       const current = parseTelemetryTokenWatermark(out.telemetryTokens);
@@ -935,10 +994,11 @@ function telemetryTokenDelta(): { processed: number; saved: number; basis: strin
       } satisfies TelemetryTokenWatermark;
     });
   } catch {
-    // Read-only home: report nothing rather than resend the same delta forever.
-    return null;
+    readOnly = true; // Read-only home: report nothing rather than resend the same delta forever.
+  } finally {
+    releaseClaimLock(lockPath);
   }
-  if (!claimed) return null;
+  if (readOnly || !claimed) return null;
   if (processed === 0 && saved === 0) return null;
   return { processed, saved, basis: totals.basis };
 }
@@ -5035,6 +5095,23 @@ async function agentShortcut(rest: string[]) {
     if (result.error) throw new Error(`failed to exec ${bin}: ${result.error.message}`);
     process.exitCode = result.status ?? 1;
     return;
+  }
+  // Some host surfaces cannot run routed at all — Claude Code Remote Control
+  // refuses any non-first-party ANTHROPIC_BASE_URL and its escape hatch does not
+  // cover the check (#947, #1101). The native door would install machine-wide
+  // routing and then launch the host straight into that refusal, leaving the
+  // user both unrouted and unable to start the surface they asked for. Resolve
+  // the override before any persistent write and hand these to wrap, whose
+  // route-override path launches the host directly and writes nothing.
+  const shortcutRouteOverride = agentRouteOverride(agent, rest.slice(1));
+  if (shortcutRouteOverride) {
+    // A native install already owns the host's base URL from its own config
+    // file, which launching directly cannot undo — say so rather than let the
+    // surface fail with the host's own opaque refusal.
+    if (readNativeJournal(native)) {
+      process.stderr.write(`${mark("warn")} ${routeOverrideLabel(agent)} ${shortcutRouteOverride.surface} ${shortcutRouteOverride.reason}, and the native integration still routes ${binOf(agent)} from its own config — run \`caveman disable ${native}\` first, then \`caveman enable ${native}\` afterwards\n`);
+    }
+    return wrap(rest);
   }
   // A Cave Build lock is enforced at the wrap door (claudeCaveBuildEnv); the
   // native door applies none of its transforms, so a locked project must keep
@@ -10232,6 +10309,7 @@ function sleep(ms: number) {
 type SyncOutcome =
   | { kind: "no_store"; dbPath: string }
   | { kind: "empty" }
+  | { kind: "busy" }
   | {
       kind: "synced";
       spans: number;
@@ -10532,6 +10610,40 @@ function writeSyncWatermark(key: string, id: number) {
   writeFileSync(syncStatePath(), JSON.stringify(state, null, 2) + "\n", { mode: 0o600 });
 }
 
+// syncClaimLockPath is the sidecar that serializes the read-query-POST-write
+// in syncLocalSavings across OS processes; it sits beside sync.json so its
+// permission and cross-filesystem behavior always matches the file it protects.
+function syncClaimLockPath(): string {
+  return `${syncStatePath()}.lock`;
+}
+
+// How long a waiter blocks before giving up and reporting `busy`. Deliberately
+// short: syncAfterWrap runs on the wrap exit path, and making a user wait out
+// someone else's upload to close a shell is worse than deferring their rows to
+// the next sync — nothing is lost either way, the watermark simply has not moved.
+const SYNC_CLAIM_LOCK_BUDGET_MS = 5000;
+
+// A sync lock is held across a network POST, which has no bounded duration, so
+// unlike the telemetry claim its stale window cannot be a guess at the hold
+// time: a live holder on a slow link would be judged dead and its rows POSTed
+// twice, which is the very bug the lock exists to prevent. The holder instead
+// heartbeats the lock while it works, so this window only has to outlast a
+// couple of missed beats.
+const SYNC_CLAIM_LOCK_STALE_MS = 15000;
+const SYNC_CLAIM_LOCK_HEARTBEAT_MS = 3000;
+
+// refreshClaimLock bumps a held lock's mtime so waiters keep seeing it as live.
+// Never throws — if the lock is gone the guarded work is already compromised,
+// and crashing the sync on a touch failure would lose the rows in flight.
+function refreshClaimLock(lockPath: string): void {
+  try {
+    const now = new Date();
+    utimesSync(lockPath, now, now);
+  } catch {
+    /* lock vanished or the FS refused the touch; the POST still completes */
+  }
+}
+
 // deriveDashboardUrl maps the control-api base URL to the dashboard costs page
 // for the two shapes Caveman ships (local docker web :3000; hosted api.<domain>
 // → apex, which serves the dashboard). Anything else returns "" — no guessing.
@@ -10677,84 +10789,111 @@ async function syncLocalSavings(cfg: Config): Promise<SyncOutcome> {
   }
   const db = new DatabaseSync(dbPath, { readOnly: true });
   let rows: Record<string, unknown>[];
-  const key = syncWatermarkKey(cfg, dbFingerprint(db, dbPath, DatabaseSync));
-  const firstSync = !hasSyncWatermark(key);
-  const since = readSyncWatermark(key);
+  let key: string;
   try {
-    const columns = new Set(
-      (db.prepare("PRAGMA table_info(requests)").all() as Record<string, unknown>[])
-        .map((row) => typeof row.name === "string" ? row.name : "")
-        .filter(Boolean),
-    );
-    const optional = (name: string, fallback: string) => columns.has(name) ? name : `${fallback} AS ${name}`;
-    rows = db
-      .prepare(
-        `SELECT id, ts, request_id, trace_id, agent_slug, provider, model,
-                status_code, error_code, latency_ms, request_bytes, response_bytes,
-                input_tokens, output_tokens, cached_input_tokens,
-                ${optional("cache_creation_input_tokens", "0")}, total_cost_usd,
-                savings_usd, basis, ${optional("token_usage_basis", "'unavailable'")},
-                ${optional("auth_mode", "'unknown'")}, runtime_mode, optimization_ids,
-                compression_tokens_before, compression_tokens_after,
-                ${optional("compression_token_count_basis", "'unavailable'")}
-           FROM requests WHERE id > ? ORDER BY id`,
-      )
-      .all(since) as Record<string, unknown>[];
-  } finally {
+    key = syncWatermarkKey(cfg, dbFingerprint(db, dbPath, DatabaseSync));
+  } catch (err) {
     db.close();
+    throw err;
   }
-  if (rows.length === 0) return { kind: "empty" };
-
-  // Per-row directive labels (review M12): a row synced from BEFORE a
-  // directive's install carries no label — backlog sessions are not evidence
-  // about a directive that did not exist yet. An unparseable row timestamp
-  // labels nothing (fail closed).
-  const directiveInstalls = installedDirectivesWithTimes();
-  const rowDirectives = (r: Record<string, unknown>): string[] => {
-    if (directiveInstalls.length === 0) return [];
-    const ts = typeof r.ts === "string" ? r.ts : "";
-    // The proxy writes ClickHouse-layout UTC timestamps ("YYYY-MM-DD HH:MM:SS.mmm").
-    const ms = Date.parse(ts.includes("T") ? ts : ts.replace(" ", "T") + "Z");
-    if (!Number.isFinite(ms)) return [];
-    return directiveInstalls.filter((d) => ms >= d.installedAtMs).map((d) => d.id);
-  };
-  const body = rows.map((r) => syncRequestSpan(r, rowDirectives(r))).join("\n") + "\n";
-  const response = await fetch(`${cfg.baseURL}/api/v1/imports?format=caveman-jsonl`, {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${cfg.token}`,
-      "content-type": "application/octet-stream",
-      "x-cave-csrf": "cli",
-    },
-    body,
-  });
-  const result = (await response.json().catch(() => ({}))) as { status?: string; error?: { message?: string } };
-  if (!response.ok || result.status !== "completed") {
-    throw new Error(result.error?.message ?? `sync import failed (${response.status})`);
+  // Everything from here to the watermark write is one claim: reading the
+  // watermark, selecting the rows past it, POSTing them and committing the new
+  // watermark. Without the lock two processes starting together both read the
+  // pre-write watermark, both select the same rows and both POST them, so the
+  // same spans land server-side twice (#1132). A waiter that cannot take the
+  // lock in its budget sends nothing and leaves the watermark alone, so its
+  // rows are picked up by the next sync rather than duplicated by this one.
+  const lockPath = syncClaimLockPath();
+  if (!acquireClaimLock(lockPath, SYNC_CLAIM_LOCK_BUDGET_MS, SYNC_CLAIM_LOCK_STALE_MS)) {
+    db.close();
+    return { kind: "busy" };
   }
+  // The POST below is unbounded, so keep proving this holder is alive; see
+  // SYNC_CLAIM_LOCK_STALE_MS.
+  const heartbeat = setInterval(() => refreshClaimLock(lockPath), SYNC_CLAIM_LOCK_HEARTBEAT_MS);
+  heartbeat.unref();
+  try {
+    const firstSync = !hasSyncWatermark(key);
+    const since = readSyncWatermark(key);
+    try {
+      const columns = new Set(
+        (db.prepare("PRAGMA table_info(requests)").all() as Record<string, unknown>[])
+          .map((row) => typeof row.name === "string" ? row.name : "")
+          .filter(Boolean),
+      );
+      const optional = (name: string, fallback: string) => columns.has(name) ? name : `${fallback} AS ${name}`;
+      rows = db
+        .prepare(
+          `SELECT id, ts, request_id, trace_id, agent_slug, provider, model,
+                  status_code, error_code, latency_ms, request_bytes, response_bytes,
+                  input_tokens, output_tokens, cached_input_tokens,
+                  ${optional("cache_creation_input_tokens", "0")}, total_cost_usd,
+                  savings_usd, basis, ${optional("token_usage_basis", "'unavailable'")},
+                  ${optional("auth_mode", "'unknown'")}, runtime_mode, optimization_ids,
+                  compression_tokens_before, compression_tokens_after,
+                  ${optional("compression_token_count_basis", "'unavailable'")}
+             FROM requests WHERE id > ? ORDER BY id`,
+        )
+        .all(since) as Record<string, unknown>[];
+    } finally {
+      db.close();
+    }
+    if (rows.length === 0) return { kind: "empty" };
 
-  const num = (v: unknown) => (typeof v === "bigint" ? Number(v) : typeof v === "number" && Number.isFinite(v) ? v : 0);
-  const maxId = rows.reduce((m, r) => Math.max(m, num(r.id)), since);
-  writeSyncWatermark(key, maxId);
-  const tokensSaved = rows.reduce((sum, r) => sum + Math.max(0, num(r.compression_tokens_before) - num(r.compression_tokens_after)), 0);
-  const tokenBases = new Set(rows.map((r) => (typeof r.compression_token_count_basis === "string" ? r.compression_token_count_basis : "")).filter(Boolean));
-  const tokenCountBasis = tokenBases.size === 0 ? "unavailable" : tokenBases.size === 1 ? [...tokenBases][0] ?? "unavailable" : "mixed";
-  const cachedInputTokens = rows.reduce((sum, r) => sum + Math.max(0, num(r.cached_input_tokens)), 0);
-  const cacheCreationInputTokens = rows.reduce((sum, r) => sum + Math.max(0, num(r.cache_creation_input_tokens)), 0);
-  const headlineCompressionRefused = cacheCreationInputTokens > cachedInputTokens;
-  const savingsUSD = rows.reduce((sum, r) => sum + num(r.savings_usd), 0);
-  return {
-    kind: "synced",
-    spans: rows.length,
-    tokensSaved,
-    tokenCountBasis,
-    cachedInputTokens,
-    cacheCreationInputTokens,
-    headlineCompressionRefused,
-    savingsUSD,
-    dashboard: deriveDashboardUrl(cfg.baseURL),
-    firstSync,
-  };
+    // Per-row directive labels (review M12): a row synced from BEFORE a
+    // directive's install carries no label — backlog sessions are not evidence
+    // about a directive that did not exist yet. An unparseable row timestamp
+    // labels nothing (fail closed).
+    const directiveInstalls = installedDirectivesWithTimes();
+    const rowDirectives = (r: Record<string, unknown>): string[] => {
+      if (directiveInstalls.length === 0) return [];
+      const ts = typeof r.ts === "string" ? r.ts : "";
+      // The proxy writes ClickHouse-layout UTC timestamps ("YYYY-MM-DD HH:MM:SS.mmm").
+      const ms = Date.parse(ts.includes("T") ? ts : ts.replace(" ", "T") + "Z");
+      if (!Number.isFinite(ms)) return [];
+      return directiveInstalls.filter((d) => ms >= d.installedAtMs).map((d) => d.id);
+    };
+    const body = rows.map((r) => syncRequestSpan(r, rowDirectives(r))).join("\n") + "\n";
+    const response = await fetch(`${cfg.baseURL}/api/v1/imports?format=caveman-jsonl`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${cfg.token}`,
+        "content-type": "application/octet-stream",
+        "x-cave-csrf": "cli",
+      },
+      body,
+    });
+    const result = (await response.json().catch(() => ({}))) as { status?: string; error?: { message?: string } };
+    if (!response.ok || result.status !== "completed") {
+      throw new Error(result.error?.message ?? `sync import failed (${response.status})`);
+    }
+
+    const num = (v: unknown) => (typeof v === "bigint" ? Number(v) : typeof v === "number" && Number.isFinite(v) ? v : 0);
+    const maxId = rows.reduce((m, r) => Math.max(m, num(r.id)), since);
+    writeSyncWatermark(key, maxId);
+    const tokensSaved = rows.reduce((sum, r) => sum + Math.max(0, num(r.compression_tokens_before) - num(r.compression_tokens_after)), 0);
+    const tokenBases = new Set(rows.map((r) => (typeof r.compression_token_count_basis === "string" ? r.compression_token_count_basis : "")).filter(Boolean));
+    const tokenCountBasis = tokenBases.size === 0 ? "unavailable" : tokenBases.size === 1 ? [...tokenBases][0] ?? "unavailable" : "mixed";
+    const cachedInputTokens = rows.reduce((sum, r) => sum + Math.max(0, num(r.cached_input_tokens)), 0);
+    const cacheCreationInputTokens = rows.reduce((sum, r) => sum + Math.max(0, num(r.cache_creation_input_tokens)), 0);
+    const headlineCompressionRefused = cacheCreationInputTokens > cachedInputTokens;
+    const savingsUSD = rows.reduce((sum, r) => sum + num(r.savings_usd), 0);
+    return {
+      kind: "synced",
+      spans: rows.length,
+      tokensSaved,
+      tokenCountBasis,
+      cachedInputTokens,
+      cacheCreationInputTokens,
+      headlineCompressionRefused,
+      savingsUSD,
+      dashboard: deriveDashboardUrl(cfg.baseURL),
+      firstSync,
+    };
+  } finally {
+    clearInterval(heartbeat);
+    releaseClaimLock(lockPath);
+  }
 }
 
 function syncSavingsLine(out: SyncedOutcome, local = false): string {
@@ -10850,6 +10989,10 @@ async function sync() {
       console.log(`nothing to sync — no local spend store at ${out.dbPath} (run \`caveman wrap <agent>\` to record local inferred savings first)`);
     } else if (out.kind === "empty") {
       console.log("nothing new to sync — local inferred savings are already up to date");
+    } else if (out.kind === "busy") {
+      // Not a failure: another caveman process holds the watermark and is
+      // uploading these rows right now. Exit 0 — re-running is always safe.
+      console.log("another sync is already running — local spans left for the next `caveman sync`");
     } else {
       if (out.firstSync) console.log(SYNC_DISCLOSURE);
       console.log(syncSavingsLine(out));
@@ -10891,6 +11034,8 @@ async function syncAfterLogin() {
     if (savingsLane.status === "fulfilled") {
       if (savingsLane.value.kind === "synced") {
         console.error(`  ${mark("ok")} ${syncSavingsLine(savingsLane.value, true)}`);
+      } else if (savingsLane.value.kind === "busy") {
+        console.error(dim(`  another sync is already running — run \`${invokedAs()} sync\` afterwards to pick up the rest`));
       } else {
         console.error(dim("  no local spans to sync yet — `caveman wrap <agent>` records inferred savings locally; `caveman sync` uploads them"));
       }
@@ -11024,8 +11169,37 @@ function mcpServerInstalled(agentId: string, serverName: string): boolean {
     return false;
   }
 }
+function nativeOpencodeMcpInstalled(): boolean {
+  const journal = readNativeJournal("opencode");
+  if (!journal) return false;
+
+  const operation = journal.operations.find((item) => item.kind === "opencode-config");
+  if (!operation?.owned?.installed_mcp) return false;
+
+  const current = fileBytes(operation.file);
+  if (!current) return false;
+
+  try {
+    const root = parseJsonFileObject(operation.file, current);
+    const mcp = root.mcp && typeof root.mcp === "object" && !Array.isArray(root.mcp)
+      ? root.mcp as Record<string, unknown>
+      : {};
+
+    // canonicalize, not JSON.stringify: the comparison is about whether the
+    // registration is still ours, and key order is not part of that. Any writer
+    // that round-trips opencode.json through a rebuilt or sorted map reorders
+    // these keys without changing the registration, and a raw stringify compare
+    // would then report "MCP recovery missing" for a registration that is
+    // present and correct — the same false negative this function exists to fix.
+    return canonicalize(mcp.caveman) === canonicalize(operation.owned.installed_mcp);
+  } catch {
+    return false;
+  }
+}
+
 function mcpInstalled(agentId: string, agentArgs: string[] = []): boolean {
   if (agentId === "kilo" || agentId === "qwen") return ownedMcpRegistration(agentId, agentArgs) !== null;
+  if (agentId === "opencode" && nativeOpencodeMcpInstalled()) return true;
   return mcpServerInstalled(agentId, "caveman");
 }
 
@@ -12819,10 +12993,28 @@ function agentRouteOverride(agent: AgentProfile, args: string[]): AgentRouteOver
   if (agent.id === "qwen") return qwenRouteOverride(agent, args);
   // Claude Code 2.1.196+ refuses Remote Control unless ANTHROPIC_BASE_URL is
   // api.anthropic.com, and the first-party escape hatch does not apply (#947).
-  if (agent.id === "claude" && args.includes("remote-control")) {
+  if (agent.id === "claude" && claudeStartsRemoteControl(args)) {
     return { surface: "remote-control", reason: "only runs against api.anthropic.com, so it cannot route through the proxy" };
   }
   return null;
+}
+
+// Claude Code spells Remote Control `--remote-control [name]`; the bare
+// `remote-control` word is the legacy subcommand. #947 matched only the latter,
+// so every user who followed the documented flag kept routing through the proxy
+// and kept being refused by the host (#1101).
+//
+// `--remote-control-session-name-prefix` only names auto-generated sessions and
+// does NOT start Remote Control, so it must not match — bypassing on it would
+// silently drop compression for a session that never needed the bypass. Scanning
+// stops at `--`, after which argv belongs to the agent's own payload.
+function claudeStartsRemoteControl(args: string[]): boolean {
+  for (const arg of args) {
+    if (arg === "--") return false;
+    if (arg === "remote-control" || arg === "--remote-control") return true;
+    if (arg.startsWith("--remote-control=")) return true;
+  }
+  return false;
 }
 
 function routeOverrideLabel(agent: AgentProfile): string {
