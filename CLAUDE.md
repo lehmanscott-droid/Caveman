@@ -314,6 +314,23 @@ The `install.sh` / `install.ps1` shims at the repo root delegate to `bin/install
 
 **Uninstall** — `npx -y github:JuliusBrussee/caveman -- --uninstall` (or `node bin/install.js --uninstall` from a clone). Strips caveman hook entries from `settings.json` via substring marker `caveman`, deletes hook files, and removes the Claude plugin / Gemini extension. Native skill copies use `bin/lib/provider-skills.js` and ownership journals; uninstall removes unchanged owned files while preserving foreign or edited content. Use the same vendor home overrides for install and uninstall. Delegated `npx skills add` installs remain managed by the host/upstream skill manager.
 
+**What uninstall does not reach.** Both `--uninstall` and a bare `claude plugin uninstall caveman@caveman` end up shelling out to the same CLI command, so both leave two things behind:
+
+- **The marketplace registration.** Install runs `claude plugin marketplace add` (`bin/install.js`, the plugin-install branch); nothing anywhere runs `claude plugin marketplace remove`. So `caveman` stays in `extraKnownMarketplaces` in `settings.json` and keeps showing up in `claude plugin marketplace list` after a successful uninstall. Costs nothing — no hooks, no skills, no tokens — but it reads as a failed uninstall to anyone who checks.
+- **The marketplace's git clone**, at `$CLAUDE_CONFIG_DIR/plugins/cache/caveman/caveman/<version>/` — a full checkout of this repo, **24M at 2.7.0**. The CLI owns that path, so our uninstaller deliberately doesn't touch it; quote the number when a user reports that uninstalling "didn't free any space".
+
+Full cleanup after a plugin-scope install:
+
+```bash
+claude plugin uninstall caveman@caveman
+claude plugin marketplace remove caveman
+rm -rf "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins/cache/caveman"
+```
+
+Hook state files are absent from that list on purpose: `--uninstall` already removes `.caveman-active`, `.caveman-active.prev`, `.caveman-mode-log.jsonl`, `.caveman-statusline-suffix`, `.caveman-nudge-shown` and the whole `.caveman-sessions/` directory, and keeps `.caveman-history.jsonl` by design. A bare `claude plugin uninstall` leaves every one of them, because the hooks write them to the config root rather than inside the plugin's own tree — so a plugin-only user who never runs `--uninstall` keeps a stale mode flag that a later reinstall picks straight back up.
+
+Verified on caveman 2.7.0 against Claude Code 2.1.284.
+
 ---
 
 ## Skill system
